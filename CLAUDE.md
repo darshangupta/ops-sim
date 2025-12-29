@@ -3,7 +3,26 @@
 ## Project Context
 This is a practice project for distributed space operations systems, designed to prepare for Anduril engineering challenges. The focus is on building resilient protocols under unreliable network conditions.
 
+## Tech Stack
+- **Transport**: Kafka + ChaosProxy layer
+- **Language**: TypeScript/Node.js
+- **Kafka Client**: KafkaJS
+- **Containers**: Docker Compose
+- **Testing**: Jest
+
 ## Key Development Commands
+
+### Infrastructure
+```bash
+# Start Kafka cluster
+docker compose up -d
+
+# Stop Kafka cluster
+docker compose down
+
+# View Kafka logs
+docker compose logs kafka
+```
 
 ### Testing Commands
 ```bash
@@ -33,15 +52,15 @@ npm run typecheck
 
 # Linting
 npm run lint
-
-# Format code
-npm run format
 ```
 
 ### Simulation Commands
 ```bash
-# Start network simulator
-npm run sim:network
+# Start chaos proxy with high failure rate
+npm run chaos:high
+
+# Start chaos proxy with low failure rate
+npm run chaos:low
 
 # Run telemetry simulation
 npm run sim:telemetry
@@ -49,11 +68,8 @@ npm run sim:telemetry
 # Run command simulation  
 npm run sim:commands
 
-# Run partition scenario
+# Run partition scenario (stop/start chaos)
 npm run sim:partition
-
-# Run full system simulation
-npm run sim:full
 ```
 
 ## Architecture Principles
@@ -82,9 +98,9 @@ npm run sim:full
 
 ### Message Protocols (`src/network/`)
 - Message envelope definitions
-- Sequence number management
-- Network simulator implementation
-- Transport abstraction
+- Kafka producer/consumer wrappers
+- ChaosProxy implementation
+- Failure injection logic
 
 ### Satellite Systems (`src/satellite/`)
 - Telemetry generation
@@ -161,9 +177,9 @@ npm run sim:full
 ## Debugging Guidelines
 
 ### Network Issues
-- Use deterministic test seeds for reproducible failures
-- Log all message drops, delays, duplicates
-- Trace sequence numbers through system
+- Use deterministic chaos seeds for reproducible failures
+- Monitor ChaosProxy metrics (drops, delays, duplicates)
+- Trace sequence numbers from Kafka through chaos layer
 
 ### State Inconsistencies  
 - Always log state transitions
