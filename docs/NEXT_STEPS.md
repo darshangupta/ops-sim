@@ -2,25 +2,32 @@
 
 ## Phase 1: Architecture Planning (Day 1 - No Code)
 
-### 1. Technology Stack Selection
-**Decision Points:**
-- **Language**: TypeScript/Node.js vs Go vs Rust vs Python
-  - Consider: Type safety, async handling, ecosystem
-  - Recommendation: TypeScript for rapid prototyping with strong types
-- **Message Serialization**: Protocol Buffers vs JSON vs MessagePack
-  - Need efficient, versioned message formats
-- **Storage**: In-memory vs SQLite vs Redis for command ledger
-- **Testing Framework**: Jest vs Vitest for scenario testing
+### 1. Finalized Technology Stack
+- **Language**: TypeScript/Node.js
+- **Transport**: Kafka + ChaosProxy layer
+- **Kafka Client**: KafkaJS
+- **Containers**: Docker Compose (Kafka cluster)
+- **Message Format**: JSON (start simple, upgrade to protobuf later)
+- **Storage**: SQLite for command ledger persistence
+- **Testing**: Jest with Docker integration
 
 ### 2. Component Architecture Design
 
-#### A. Message Transport Layer
+#### A. Kafka + Chaos Transport Layer
+
+ChaosProxy wraps KafkaJS client calls as an application-level interceptor pattern (not a separate service):
+
+- **Producer side**: `producer.send()` → `ChaosProxy.send()` → (failure injection) → `kafka.producer.send()`
+- **Consumer side**: `kafka.consumer.run()` → (message received) → `ChaosProxy.intercept()` → handler
+- **Implementation**: Application-level wrapper/interceptor pattern wrapping KafkaJS producer and consumer
+- **Failure injection**: Occurs before messages reach Kafka (producer side) and after messages leave Kafka (consumer side)
+
 ```
-UnreliableNetwork
-├── MessageBus (core unreliable transport)
-├── MessageEnvelope (ID, seq, timestamp, payload)
-├── NetworkSimulator (controlled chaos)
-└── FailureInjector (drops, delays, duplicates)
+Kafka Cluster (reliable baseline)
+├── Producer → Topic → Consumer
+├── ChaosProxy (failure injection wrapper)
+├── MessageEnvelope (app-level protocol)
+└── DeterministicChaos (seeded failures)
 ```
 
 #### B. Satellite Component
@@ -50,14 +57,28 @@ SensorNetwork
 └── UncertaintyManager (confidence tracking)
 ```
 
-### 3. Protocol Specifications
+### 3. System Guarantees & Non-Guarantees
+
+#### Guarantees
+- **At-most-once command execution**: Commands are executed at most once via idempotent execution ledger (commandId deduplication)
+- **Monotonic telemetry sequence per satellite**: Ground control maintains monotonic sequence numbers per satellite; stale telemetry (older sequence) never overwrites fresh state
+- **Command state persistence across satellite reboots**: SQLite command ledger persists command execution state; satellite can recover and replay command history on restart
+- **Duplicate message detection**: All messages include unique messageId; duplicate messages are detected and handled idempotently via messageId deduplication cache
+
+#### Non-Guarantees
+- **Message delivery ordering**: Messages may arrive out of sequence; application-level sequence numbers required for ordering
+- **Message delivery latency**: No SLA on message delivery time; messages may be delayed arbitrarily by network conditions
+- **Delivery reliability**: Messages may be dropped by ChaosProxy or network conditions; no guaranteed delivery semantics
+- **Global clock synchronization**: No synchronized clocks assumed; all timestamps are local/monotonic per node
+- **Real-time processing**: No timing guarantees on processing speed; system prioritizes correctness over latency
+
+### 4. Protocol Specifications
 
 #### Message Envelope Standard
 ```typescript
 interface MessageEnvelope {
   messageId: string;        // UUID for deduplication
-  sequenceNumber: number;   // Monotonic per-sender
-  logicalClock: number;     // Vector/Lamport clock
+  sequenceNumber: number;   // Monotonic per-sender --> our ordering type
   sourceNode: string;       // Sender identification
   destinationNode?: string; // Optional targeting
   messageType: MessageType;
@@ -112,20 +133,20 @@ interface TrackObservation {
 }
 ```
 
-### 4. State Machine Definitions
+### 5. State Machine Definitions
 
 #### Satellite Command State Machine
 ```
-States: IDLE → QUEUED → EXECUTING → COMPLETED
-                ↓
-              FAILED
+States: UNKNOWN → PENDING → EXECUTING → EXECUTED
+                           ↓
+                         FAILED
 
 Transitions:
-- Command received → QUEUED (if valid, idempotent)
+- Command received → PENDING (if valid, idempotent check via commandId)
 - Execution start → EXECUTING  
-- Success → COMPLETED
+- Success → EXECUTED
 - Error → FAILED
-- Duplicate → No transition (idempotent)
+- Duplicate → No transition (idempotent - commandId already in ledger)
 ```
 
 #### Ground Control Telemetry State Machine
@@ -133,14 +154,24 @@ Transitions:
 States: UNKNOWN → STALE → CURRENT → SUSPECT
 
 Transitions:
-- Fresh telemetry → CURRENT
-- Newer sequence → CURRENT (update)
-- Older sequence → No change (reject)
-- Timeout → STALE
-- Conflict → SUSPECT
+- Fresh telemetry → CURRENT (log transition: UNKNOWN→CURRENT)
+- Newer sequence → CURRENT (update, log sequence update)
+- Older sequence → No change (reject, log as "STALE_REJECTED" event)
+- Timeout → STALE (log transition: CURRENT→STALE, alert operator)
+- Conflict → SUSPECT (log transition: CURRENT→SUSPECT, alert operator)
+
+Staleness Handling Rules:
+- **Sequence Window**: Accept sequences within window of current_max_seq (window_size = 100)
+  - If sequence < (current_max_seq - 100): Reject, log as "STALE_REJECTED" (too old)
+  - If sequence >= (current_max_seq - 100) and < current_max_seq: Log as gap detection, but reject (out-of-order but within window)
+- **Gap Detection**: If seq N arrives then seq N-2 arrives (gap of 1 missing sequence):
+  - Log gap detection event (missing sequence N-1)
+  - Accept seq N-2 if within sequence window (seq N-2 >= current_max_seq - 100)
+  - Do not update current_max_seq if accepting out-of-order sequence (maintain monotonic view)
+- **Rejection Behavior**: Older sequences are logged with "STALE_REJECTED" event and state is not updated (monotonic guarantee preserved)
 ```
 
-### 5. Failure Mode Analysis
+### 6. Failure Mode Analysis
 
 #### Network Failures
 | Failure Type | Detection | Recovery | Impact |
@@ -148,7 +179,18 @@ Transitions:
 | Message Drop | Timeout/Missing Seq | Retry | Data loss |
 | Message Delay | Out-of-order arrival | Sequence check | Stale data |
 | Message Duplicate | Message ID cache | Idempotent handler | None |
-| Partition | Heartbeat timeout | Reconnect + reconcile | Temporary inconsistency |
+| Partition | Heartbeat timeout (>30s), missing expected ACKs, sequence number gaps | Reconnect + reconcile | See details below |
+
+**Partition Failure Details:**
+- **Inconsistent State**: Ground control shows UNKNOWN command status for commands sent during partition; satellite may have executed commands but ground hasn't received ACK
+- **Detection**: Heartbeat timeout (>30s), missing expected ACKs, sequence number gaps in telemetry stream
+- **Duration**: Until partition resolves (reconnection established, bidirectional communication restored)
+- **Reconciliation Process**:
+  - Satellite replays command ledger on reconnection (all commands executed during partition)
+  - Ground queries missing command IDs (commands with UNKNOWN status during partition)
+  - Explicit state transitions: UNKNOWN → EXECUTED/PENDING/FAILED (logged for audit)
+  - Telemetry sequence gaps filled where possible (out-of-order messages may arrive after partition)
+- **Operator Visibility**: All UNKNOWN states surfaced in operator interface during partition; reconciliation process fully logged with state transitions
 
 #### System Failures
 | Failure Type | Detection | Recovery | Impact |
@@ -170,44 +212,57 @@ Transitions:
 
 ### Immediate Next Actions
 
-1. **Technology Decision**
-   - Choose language/framework
-   - Set up package.json/project config
-   - Initialize testing framework
+1. **Day 2 Setup** (Tomorrow)
+   - Create `package.json` and `docker-compose.yml`
+   - Implement ChaosProxy with configurable failure modes
+   - Create MessageEnvelope protocol
+   - Set up deterministic testing with seeds
 
-2. **Architecture Validation**
-   - Review message protocols for completeness
-   - Validate state machines for correctness
-   - Plan test scenarios for each component
+2. **Kafka Infrastructure**
+   - Single-node Kafka cluster in Docker
+   - Topics: `telemetry`, `commands`, `tracking`
+   - ChaosProxy as middleware layer
 
-3. **Begin Day 2 Implementation**
-   - Start with network simulator
-   - Implement basic message envelope
-   - Create deterministic failure injection
+3. **Core Implementation Order**
+   - Day 2: Kafka + ChaosProxy + basic message envelope
+   - Day 3: Satellite telemetry through chaos
+   - Day 4: Command execution with durable ledger
 
-## Architecture Review Questions
+## Key Architecture Decisions Made
 
-Before proceeding, consider:
+1. **Kafka + ChaosProxy**: Real messaging infrastructure with controlled failure injection via application-level wrapper
+2. **Sequence Numbers**: Use monotonic sequence numbers per sender for message ordering (no logical clocks)
+3. **SQLite Persistence**: Command ledger survives satellite reboots
+4. **UNKNOWN States**: Explicit operator visibility in all UIs
+5. **Simple First**: JSON → Protobuf migration path, avoid premature optimization
 
-1. **Message Ordering**: How do we handle causally related messages?
-2. **Clock Synchronization**: Should we use vector clocks or logical timestamps?
-3. **State Persistence**: What state must survive restarts?
-4. **Operator Experience**: How do we surface UNKNOWN states clearly?
-5. **Performance**: What are acceptable latency/throughput targets?
-6. **Security**: Do we need message authentication?
+## Implementation Checklist
 
-## Risk Mitigation
+### Day 2: Kafka + Chaos Foundation
+- [ ] Docker Compose with Kafka
+- [ ] ChaosProxy with drop/delay/duplicate/reorder
+- [ ] MessageEnvelope with sequence numbers
+- [ ] Deterministic failure seeds
+- [ ] Basic producer/consumer examples
 
-### Technical Risks
-- **Complexity Creep**: Stick to 7-day plan, resist feature additions
-- **Over-Engineering**: Prefer simple solutions over clever ones
-- **Testing Gaps**: Ensure each failure mode has explicit test coverage
+### Days 3-7: Component Implementation
+- [ ] Day 3: Satellite telemetry emission + ground aggregation
+- [ ] Day 4: Command dispatch + execution + ACKs
+- [ ] Day 5: Multi-sensor track fusion
+- [ ] Day 6: 90-second partition scenario
+- [ ] Day 7: End-to-end integration testing
 
-### Schedule Risks  
-- **Day 1 Scope**: Don't code today - design only
-- **Integration Time**: Reserve Day 7 for system-level testing
-- **Debug Time**: Build observability from the start
+## ChaosProxy Configuration
 
----
+```typescript
+// Example chaos configuration
+const chaosConfig = {
+  dropRate: 0.1,           // 10% message drops
+  duplicateRate: 0.05,     // 5% duplicates  
+  maxDelayMs: 5000,        // Up to 5s delays
+  reorderWindow: 10,       // Reorder within 10 messages
+  seed: 12345              // Deterministic for tests
+};
+```
 
-**Ready to proceed with technology selection and detailed architecture design.**
+**Status: Architecture finalized, ready for Day 2 implementation.**
