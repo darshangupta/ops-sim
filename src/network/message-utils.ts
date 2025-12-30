@@ -19,7 +19,7 @@ export class MessageUtils {
       messageId: uuidv4(),
       sequenceNumber,
       sourceNode,
-      destinationNode,
+      destinationNode: destinationNode || '',
       messageType,
       timestamp: Date.now(),
       payload,
