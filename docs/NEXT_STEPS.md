@@ -61,7 +61,8 @@ SensorNetwork
 
 #### Guarantees
 - **At-most-once command execution**: Commands are executed at most once via idempotent execution ledger (commandId deduplication)
-- **Monotonic telemetry sequence per satellite**: Ground control maintains monotonic sequence numbers per satellite; stale telemetry (older sequence) never overwrites fresh state
+- **Monotonic telemetry sequence per satellit
+e**: Ground control maintains monotonic sequence numbers per satellite; stale telemetry (older sequence) never overwrites fresh state
 - **Command state persistence across satellite reboots**: SQLite command ledger persists command execution state; satellite can recover and replay command history on restart
 - **Duplicate message detection**: All messages include unique messageId; duplicate messages are detected and handled idempotently via messageId deduplication cache
 
