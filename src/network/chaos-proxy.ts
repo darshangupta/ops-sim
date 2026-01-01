@@ -44,7 +44,7 @@ export class ChaosProxy {
 
   // Apply chaos to a message during send
   async processSendMessage<T>(
-    envelope: MessageEnvelope<T>,
+    tempEnvelope: { messageType: MessageType; payload: T; messageId?: string },
     sendFn: () => Promise<MessageEnvelope<T>>
   ): Promise<MessageEnvelope<T> | null> {
     this.stats.sent++;
@@ -56,7 +56,7 @@ export class ChaosProxy {
     // Drop message?
     if (this.random() < this.config.dropRate) {
       this.stats.dropped++;
-      console.log(`🔥 [CHAOS] Dropped message ${envelope.messageId} (${envelope.messageType})`);
+      console.log(`🔥 [CHAOS] Dropped message (${tempEnvelope.messageType})`);
       return null; // Message dropped, don't send
     }
 
@@ -66,17 +66,18 @@ export class ChaosProxy {
     // Duplicate message?
     if (this.random() < this.config.duplicateRate) {
       this.stats.duplicated++;
-      console.log(`🔄 [CHAOS] Duplicating message ${envelope.messageId}`);
+      console.log(`🔄 [CHAOS] Duplicating message ${result.messageId}`);
       
       // Send duplicate after a small delay
+      const duplicateDelay = Math.max(1, 50 + Math.random() * 200); // Ensure positive timeout
       setTimeout(async () => {
         try {
           await sendFn();
-          console.log(`🔄 [CHAOS] Duplicate sent for ${envelope.messageId}`);
+          console.log(`🔄 [CHAOS] Duplicate sent for ${result.messageId}`);
         } catch (error) {
           console.error(`❌ [CHAOS] Failed to send duplicate:`, error);
         }
-      }, 50 + Math.random() * 200);
+      }, duplicateDelay);
     }
 
     return result;
@@ -108,7 +109,7 @@ export class ChaosProxy {
       if (delay > 0) {
         this.stats.delayed++;
         console.log(`⏰ [CHAOS] Delaying message ${envelope.messageId} by ${delay}ms`);
-        setTimeout(() => handler(envelope), delay);
+        setTimeout(() => handler(envelope), Math.max(1, delay)); // Ensure positive timeout
       } else {
         await handler(envelope);
       }
@@ -142,7 +143,7 @@ export class ChaosProxy {
       const delay = this.calculateDelay();
       if (delay > 0) {
         this.stats.delayed++;
-        setTimeout(() => handler(envelope), delay);
+        setTimeout(() => handler(envelope), Math.max(1, delay)); // Ensure positive timeout
       } else {
         await handler(envelope);
       }
@@ -156,7 +157,9 @@ export class ChaosProxy {
     
     // 30% chance of delay, exponential distribution
     if (this.random() < 0.3) {
-      return Math.floor(this.random() * this.config.maxDelayMs);
+      const delay = Math.floor(this.random() * this.config.maxDelayMs);
+      // Ensure delay is never negative
+      return Math.max(0, delay);
     }
     
     return 0;
@@ -214,11 +217,12 @@ class ChaoticProducer {
     payload: T,
     destinationNode?: string
   ): Promise<MessageEnvelope<T> | null> {
-    const tempEnvelope = { messageType, payload } as any; // For chaos decision
-    
-    return this.chaos.processSendMessage(tempEnvelope, async () => {
-      return this.producer.sendMessage(topic, messageType, payload, destinationNode);
-    });
+    return this.chaos.processSendMessage(
+      { messageType, payload },
+      async () => {
+        return this.producer.sendMessage(topic, messageType, payload, destinationNode);
+      }
+    );
   }
 
   getNodeId(): string {

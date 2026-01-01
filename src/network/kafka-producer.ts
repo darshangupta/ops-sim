@@ -23,6 +23,9 @@ export class KafkaProducer {
       allowAutoTopicCreation: false,
       transactionTimeout: 30000,
     });
+    
+    // Suppress KafkaJS partitioner warning
+    process.env.KAFKAJS_NO_PARTITIONER_WARNING = '1';
   }
 
   async connect(): Promise<void> {
